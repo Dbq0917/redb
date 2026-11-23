@@ -583,6 +583,9 @@ impl<'txn, K: Key + 'static, V: Key + 'static> MultimapTable<'txn, K, V> {
         let mut panic_guard = PanicGuard::new(self.transaction);
         let result = self.insert_inner(key, value);
         panic_guard.disarm();
+        if let Err(ref error) = result {
+            self.transaction.poison_on_table_error(&self.name, error);
+        }
         result
     }
 
@@ -768,6 +771,9 @@ impl<'txn, K: Key + 'static, V: Key + 'static> MultimapTable<'txn, K, V> {
         let mut panic_guard = PanicGuard::new(self.transaction);
         let result = self.remove_inner(key, value);
         panic_guard.disarm();
+        if let Err(ref error) = result {
+            self.transaction.poison_on_table_error(&self.name, error);
+        }
         result
     }
 

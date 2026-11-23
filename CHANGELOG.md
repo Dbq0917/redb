@@ -1,5 +1,12 @@
 # redb - Changelog
 
+## Unreleased
+
+### Bug fixes
+* Fix a failed table open or write in a multi-table write transaction leaving the transaction
+  committable, which could commit the changes to its other tables without the one that failed.
+  The transaction is now rolled back as a whole.
+
 ## 5.0.0 - 2026-11-18
 
 ### Breaking changes

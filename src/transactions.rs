@@ -613,6 +613,9 @@ impl SystemNamespace {
 
 struct TableNamespace {
     open_tables: BTreeMap<String, &'static panic::Location<'static>>,
+    // Tables this transaction has opened or otherwise changed. A failed open or write must not
+    // let changes to another table commit as if the transaction had succeeded.
+    changed_tables: BTreeSet<String>,
     allocated_pages: Arc<PageTracker>,
     freed_pages: Arc<Mutex<Vec<PageNumber>>>,
     table_tree: TableTreeMut,
@@ -637,19 +640,25 @@ impl TableNamespace {
         );
         Self {
             open_tables: BTreeMap::default(),
+            changed_tables: BTreeSet::default(),
             table_tree,
             freed_pages,
             allocated_pages: allocated,
         }
     }
 
-    fn set_dirty(&mut self, transaction: &WriteTransaction) {
+    fn set_dirty(&mut self, transaction: &WriteTransaction, name: &str) {
         transaction.dirty.store(true, Ordering::Release);
+        self.changed_tables.insert(name.to_string());
         if !transaction.transaction_tracker.any_savepoint_exists() {
             // No savepoints exist, and we don't allow savepoints to be created in a dirty transaction
             // so we can disable allocation tracking now
             self.allocated_pages.disable();
         }
+    }
+
+    fn has_changes_other_than(&self, name: &str) -> bool {
+        self.changed_tables.iter().any(|table| table != name)
     }
 
     fn set_root(&mut self, root: Option<BtreeHeader>) {
@@ -685,8 +694,19 @@ impl TableNamespace {
     ) -> Result<MultimapTable<'txn, K, V>, TableError> {
         #[cfg(feature = "logging")]
         debug!("Opening multimap table: {definition}");
-        let (root, length) = self.inner_open::<K, V>(definition.name(), TableType::Multimap)?;
-        self.set_dirty(transaction);
+        let name = definition.name();
+        let (root, length) = match self.inner_open::<K, V>(name, TableType::Multimap) {
+            Ok(opened) => opened,
+            Err(error) => {
+                // A failed open may have changed the catalog, and must not let writes to another
+                // table of this transaction commit on their own.
+                if matches!(error, TableError::Storage(_)) || self.has_changes_other_than(name) {
+                    transaction.poison();
+                }
+                return Err(error);
+            }
+        };
+        self.set_dirty(transaction, name);
 
         Ok(MultimapTable::new(
             definition.name(),
@@ -707,8 +727,19 @@ impl TableNamespace {
     ) -> Result<Table<'txn, K, V>, TableError> {
         #[cfg(feature = "logging")]
         debug!("Opening table: {definition}");
-        let (root, _) = self.inner_open::<K, V>(definition.name(), TableType::Normal)?;
-        self.set_dirty(transaction);
+        let name = definition.name();
+        let (root, _) = match self.inner_open::<K, V>(name, TableType::Normal) {
+            Ok(opened) => opened,
+            Err(error) => {
+                // See open_multimap_table(): a half-changed transaction must not commit another
+                // table's writes instead.
+                if matches!(error, TableError::Storage(_)) || self.has_changes_other_than(name) {
+                    transaction.poison();
+                }
+                return Err(error);
+            }
+        };
+        self.set_dirty(transaction, name);
 
         Ok(Table::new(
             definition.name(),
@@ -743,7 +774,8 @@ impl TableNamespace {
     ) -> Result<(), TableError> {
         #[cfg(feature = "logging")]
         debug!("Renaming table: {name} to {new_name}");
-        self.set_dirty(transaction);
+        self.set_dirty(transaction, name);
+        self.set_dirty(transaction, new_name);
         let result = self.inner_rename(name, new_name, TableType::Normal);
         // A half-renamed catalog must not be committed, so any storage error poisons
         if matches!(result, Err(TableError::Storage(_))) {
@@ -761,7 +793,8 @@ impl TableNamespace {
     ) -> Result<(), TableError> {
         #[cfg(feature = "logging")]
         debug!("Renaming multimap table: {name} to {new_name}");
-        self.set_dirty(transaction);
+        self.set_dirty(transaction, name);
+        self.set_dirty(transaction, new_name);
         let result = self.inner_rename(name, new_name, TableType::Multimap);
         // See rename_table(): a half-renamed catalog must not be committed
         if matches!(result, Err(TableError::Storage(_))) {
@@ -787,7 +820,7 @@ impl TableNamespace {
     ) -> Result<bool, TableError> {
         #[cfg(feature = "logging")]
         debug!("Deleting table: {name}");
-        self.set_dirty(transaction);
+        self.set_dirty(transaction, name);
         let result = self.inner_delete(name, TableType::Normal);
         // The catalog removal is not error-atomic part way through, so any storage error poisons
         if matches!(result, Err(TableError::Storage(_))) {
@@ -804,7 +837,7 @@ impl TableNamespace {
     ) -> Result<bool, TableError> {
         #[cfg(feature = "logging")]
         debug!("Deleting multimap table: {name}");
-        self.set_dirty(transaction);
+        self.set_dirty(transaction, name);
         let result = self.inner_delete(name, TableType::Multimap);
         // See delete_table(): a partial catalog removal must not be committed
         if matches!(result, Err(TableError::Storage(_))) {
@@ -1007,6 +1040,17 @@ impl WriteTransaction {
 
     fn is_poisoned(&self) -> bool {
         self.poisoned.load(Ordering::Acquire)
+    }
+
+    // A failed table operation may have changed that table part way. If this transaction has
+    // changed another table too, let the whole transaction fail instead of committing a subset.
+    // Validation errors before any change keep the transaction usable, unless another table's
+    // write would then commit without this one.
+    pub(crate) fn poison_on_table_error(&self, table: &str, error: &StorageError) {
+        let partial = !matches!(error, StorageError::ValueTooLarge(_));
+        if partial || self.tables.lock().unwrap().has_changes_other_than(table) {
+            self.poison();
+        }
     }
 
     // A PageAllocator for this transaction. All clones share the same

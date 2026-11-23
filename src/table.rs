@@ -140,12 +140,24 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
 
     /// Removes and returns the first key-value pair in the table
     pub fn pop_first(&mut self) -> Result<Option<(AccessGuard<'_, K>, AccessGuard<'_, V>)>> {
-        self.tree.pop_first()
+        let mut panic_guard = PanicGuard::new(self.transaction);
+        let result = self.tree.pop_first();
+        panic_guard.disarm();
+        if let Err(ref error) = result {
+            self.transaction.poison_on_table_error(&self.name, error);
+        }
+        result
     }
 
     /// Removes and returns the last key-value pair in the table
     pub fn pop_last(&mut self) -> Result<Option<(AccessGuard<'_, K>, AccessGuard<'_, V>)>> {
-        self.tree.pop_last()
+        let mut panic_guard = PanicGuard::new(self.transaction);
+        let result = self.tree.pop_last();
+        panic_guard.disarm();
+        if let Err(ref error) = result {
+            self.transaction.poison_on_table_error(&self.name, error);
+        }
+        result
     }
 
     /// Applies `predicate` to all key-value pairs in the specified range. All entries for which
@@ -188,8 +200,13 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
         upper: Bound<Vec<u8>>,
         predicate: F,
     ) -> Result<ExtractIf<'_, K, V, F>> {
-        let inner = self.tree.extract_from_bounds(lower, upper, predicate)?;
-        Ok(ExtractIf::new(inner, Some(self.transaction)))
+        match self.tree.extract_from_bounds(lower, upper, predicate) {
+            Ok(inner) => Ok(ExtractIf::new(inner, Some(self.transaction))),
+            Err(error) => {
+                self.transaction.poison_on_table_error(&self.name, &error);
+                Err(error)
+            }
+        }
     }
 
     /// Applies `predicate` to all key-value pairs. All entries for which
@@ -236,6 +253,8 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
         panic_guard.disarm();
         if poisoned {
             self.transaction.poison();
+        } else if let Err(ref error) = result {
+            self.transaction.poison_on_table_error(&self.name, error);
         }
         result
     }
@@ -250,18 +269,33 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
         key: impl Borrow<K::SelfType<'k>>,
         value: impl Borrow<V::SelfType<'v>>,
     ) -> Result<Option<AccessGuard<'_, V>>> {
+        let mut panic_guard = PanicGuard::new(self.transaction);
         let value_len = V::as_bytes(value.borrow()).as_ref().len();
         if value_len > MAX_VALUE_LENGTH {
-            return Err(StorageError::ValueTooLarge(value_len));
+            let error = StorageError::ValueTooLarge(value_len);
+            panic_guard.disarm();
+            self.transaction.poison_on_table_error(&self.name, &error);
+            return Err(error);
         }
         let key_len = K::as_bytes(key.borrow()).as_ref().len();
         if key_len > MAX_VALUE_LENGTH {
-            return Err(StorageError::ValueTooLarge(key_len));
+            let error = StorageError::ValueTooLarge(key_len);
+            panic_guard.disarm();
+            self.transaction.poison_on_table_error(&self.name, &error);
+            return Err(error);
         }
         if value_len + key_len > MAX_PAIR_LENGTH {
-            return Err(StorageError::ValueTooLarge(value_len + key_len));
+            let error = StorageError::ValueTooLarge(value_len + key_len);
+            panic_guard.disarm();
+            self.transaction.poison_on_table_error(&self.name, &error);
+            return Err(error);
         }
-        self.tree.insert(key.borrow(), value.borrow())
+        let result = self.tree.insert(key.borrow(), value.borrow());
+        panic_guard.disarm();
+        if let Err(ref error) = result {
+            self.transaction.poison_on_table_error(&self.name, error);
+        }
+        result
     }
 
     /// Removes the given key
@@ -271,7 +305,13 @@ impl<'txn, K: Key + 'static, V: Value + 'static> Table<'txn, K, V> {
         &mut self,
         key: impl Borrow<K::SelfType<'a>>,
     ) -> Result<Option<AccessGuard<'_, V>>> {
-        self.tree.remove(key.borrow())
+        let mut panic_guard = PanicGuard::new(self.transaction);
+        let result = self.tree.remove(key.borrow());
+        panic_guard.disarm();
+        if let Err(ref error) = result {
+            self.transaction.poison_on_table_error(&self.name, error);
+        }
+        result
     }
 
     /// Returns a [`CursorMut`] pointing at the gap before the smallest key
@@ -393,17 +433,32 @@ impl<K: Key + 'static, V: MutInPlaceValue + 'static> Table<'_, K, V> {
         key: impl Borrow<K::SelfType<'a>>,
         value_length: usize,
     ) -> Result<AccessGuardMutInPlace<'_, V>> {
+        let mut panic_guard = PanicGuard::new(self.transaction);
         if value_length > MAX_VALUE_LENGTH {
-            return Err(StorageError::ValueTooLarge(value_length));
+            let error = StorageError::ValueTooLarge(value_length);
+            panic_guard.disarm();
+            self.transaction.poison_on_table_error(&self.name, &error);
+            return Err(error);
         }
         let key_len = K::as_bytes(key.borrow()).as_ref().len();
         if key_len > MAX_VALUE_LENGTH {
-            return Err(StorageError::ValueTooLarge(key_len));
+            let error = StorageError::ValueTooLarge(key_len);
+            panic_guard.disarm();
+            self.transaction.poison_on_table_error(&self.name, &error);
+            return Err(error);
         }
         if value_length + key_len > MAX_PAIR_LENGTH {
-            return Err(StorageError::ValueTooLarge(value_length + key_len));
+            let error = StorageError::ValueTooLarge(value_length + key_len);
+            panic_guard.disarm();
+            self.transaction.poison_on_table_error(&self.name, &error);
+            return Err(error);
         }
-        self.tree.insert_reserve(key.borrow(), value_length)
+        let result = self.tree.insert_reserve(key.borrow(), value_length);
+        panic_guard.disarm();
+        if let Err(ref error) = result {
+            self.transaction.poison_on_table_error(&self.name, error);
+        }
+        result
     }
 }
 

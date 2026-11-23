@@ -5841,3 +5841,86 @@ fn multimap_table_definition_new_panics_on_empty_name() {
     let name = String::new();
     let _def: MultimapTableDefinition<u64, u64> = MultimapTableDefinition::new(&name);
 }
+
+// Tables changed by one write transaction must commit together. A failure to open the second
+// table (here, its stored types differ) must not let the first table commit on its own.
+#[test]
+fn failed_second_table_open_rolls_back_first_table() {
+    const ORDERS: TableDefinition<u64, u64> = TableDefinition::new("orders");
+    const INVENTORY: TableDefinition<u64, u64> = TableDefinition::new("inventory");
+
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let txn = db.begin_write().unwrap();
+    {
+        txn.open_table(ORDERS).unwrap().insert(1, 1).unwrap();
+        txn.open_table(INVENTORY).unwrap().insert(1, 1).unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    txn.open_table(ORDERS).unwrap().insert(2, 2).unwrap();
+    let wrong_type: TableDefinition<&str, &str> = TableDefinition::new("inventory");
+    assert!(matches!(
+        txn.open_table(wrong_type),
+        Err(TableError::TableTypeMismatch { .. })
+    ));
+    let result = txn.commit();
+    assert!(
+        matches!(result, Err(CommitError::TransactionPoisoned)),
+        "{result:?}"
+    );
+
+    let txn = db.begin_read().unwrap();
+    let orders = txn.open_table(ORDERS).unwrap();
+    let inventory = txn.open_table(INVENTORY).unwrap();
+    assert_eq!(orders.len().unwrap(), 1);
+    assert!(orders.get(2).unwrap().is_none());
+    assert_eq!(inventory.len().unwrap(), 1);
+
+    // The failure belonged to that transaction, not to later writers.
+    db.begin_write().unwrap().commit().unwrap();
+}
+
+// A failed write to the second table is part of the same transaction's scope: it rolls back the
+// first table rather than committing a partial order.
+#[test]
+fn failed_second_table_write_rolls_back_first_table() {
+    const ORDERS: TableDefinition<u64, u64> = TableDefinition::new("orders");
+    const INVENTORY: TableDefinition<u64, &[u8]> = TableDefinition::new("inventory");
+
+    let tmpfile = create_tempfile();
+    let db = Database::create(tmpfile.path()).unwrap();
+
+    let txn = db.begin_write().unwrap();
+    {
+        txn.open_table(ORDERS).unwrap().insert(1, 1).unwrap();
+        txn.open_table(INVENTORY)
+            .unwrap()
+            .insert(1, b"1".as_slice())
+            .unwrap();
+    }
+    txn.commit().unwrap();
+
+    let txn = db.begin_write().unwrap();
+    txn.open_table(ORDERS).unwrap().insert(2, 2).unwrap();
+    let mut inventory = txn.open_table(INVENTORY).unwrap();
+    assert!(matches!(
+        inventory.insert_reserve(2, usize::MAX),
+        Err(StorageError::ValueTooLarge(_))
+    ));
+    drop(inventory);
+    let result = txn.commit();
+    assert!(
+        matches!(result, Err(CommitError::TransactionPoisoned)),
+        "{result:?}"
+    );
+
+    let txn = db.begin_read().unwrap();
+    let orders = txn.open_table(ORDERS).unwrap();
+    assert_eq!(orders.len().unwrap(), 1);
+    assert!(orders.get(2).unwrap().is_none());
+
+    db.begin_write().unwrap().commit().unwrap();
+}
