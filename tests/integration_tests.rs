@@ -2071,6 +2071,35 @@ fn dynamic_growth() {
 }
 
 #[test]
+fn small_transactions_grow_the_file_in_small_tiers() {
+    let tmpfile = create_tempfile();
+    let table_definition: TableDefinition<u64, &[u8]> = TableDefinition::new("x");
+    let db = Database::create(tmpfile.path()).unwrap();
+    let value = vec![4u8; 32];
+
+    // One small transaction per record. With doubling growth the file held up to ~2.2x the
+    // stored data on this workload; tiered growth must keep it under 1.6x.
+    const NUM_RECORDS: u64 = 100_000;
+    for i in 0..NUM_RECORDS {
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(table_definition).unwrap();
+            table.insert(&i, value.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+
+    let file_size = tmpfile.as_file().metadata().unwrap().len();
+    let read = db.begin_read().unwrap();
+    let table = read.open_table(table_definition).unwrap();
+    let stored = table.stats().unwrap().stored_bytes();
+    assert!(
+        file_size <= stored * 8 / 5,
+        "file size {file_size} exceeds 1.6x stored bytes {stored}"
+    );
+}
+
+#[test]
 fn multi_page_kv() {
     let tmpfile = create_tempfile();
     let elements = 4;

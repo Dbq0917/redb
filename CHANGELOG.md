@@ -1,5 +1,13 @@
 # redb - Changelog
 
+## Unreleased
+
+### Changes
+* Grow databases smaller than one region by 1.25x instead of doubling, so workloads made of many
+  small transactions keep the file closer to the amount of stored data. Growth still guarantees
+  enough headroom for the triggering allocation and remains geometric, so resize frequency only
+  increases modestly.
+
 ## 5.0.0 - 2026-11-18
 
 ### Breaking changes

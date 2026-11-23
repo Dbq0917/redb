@@ -54,6 +54,24 @@ pub(super) const MIN_USABLE_PAGES: u32 = 10;
 // costs only a few extra resizes
 const MIN_DESIRED_USABLE_BYTES: u64 = 64 * 1024;
 
+// Target extra headroom added while the file is still smaller than a full region. Doubling made
+// the file hold almost twice the live data for small-transaction workloads, because the trailing
+// free pages can only be trimmed when they happen to land at the end of the file. Growing by 1.25x
+// bounds the unused space to about a fifth, while still amortizing resizes geometrically.
+const GROWTH_NUMERATOR: u64 = 5;
+const GROWTH_DENOMINATOR: u64 = 4;
+// Never let a single grow() extend by less than this many times the triggering allocation.
+// Keeps the number of resizes small for workloads that grow in evenly sized steps.
+const MIN_GROWTH_HEADROOM_MULTIPLE: u64 = 2;
+
+// Desired usable bytes after the next grow(), for a file that has not yet reached a full region.
+// Pure function so the growth tiers can be unit tested without touching storage.
+fn next_desired_usable_bytes(current_usable: u64, required_growth: u64) -> u64 {
+    let geometric = current_usable * GROWTH_NUMERATOR / GROWTH_DENOMINATOR;
+    let with_headroom = current_usable + required_growth * MIN_GROWTH_HEADROOM_MULTIPLE;
+    max(geometric, with_headroom)
+}
+
 pub(super) const INITIAL_REGIONS: u32 = 1000; // Enough for a 4TiB database
 
 // Original file format. No lengths stored with btrees
@@ -2401,10 +2419,7 @@ impl TransactionalMemory {
                 layout.usable_bytes() + max_region_size
             }
         } else {
-            max(
-                layout.usable_bytes() * 2,
-                layout.usable_bytes() + required_growth * 2,
-            )
+            next_desired_usable_bytes(layout.usable_bytes(), required_growth)
         };
         let new_layout = DatabaseLayout::calculate(
             next_desired_size,
@@ -2527,7 +2542,42 @@ impl TransactionalMemory {
 #[cfg(test)]
 mod test {
     use crate::tree_store::page_store::page_manager::INITIAL_REGIONS;
+    use crate::tree_store::page_store::page_manager::next_desired_usable_bytes;
     use crate::{Database, TableDefinition};
+
+    #[test]
+    fn growth_is_1_25x_for_small_allocations() {
+        // A page-sized allocation on a 64KiB file grows by 1.25x, not by 2x
+        let current = 64 * 1024u64;
+        let required = 4096u64;
+        let next = next_desired_usable_bytes(current, required);
+        assert_eq!(next, current * 5 / 4);
+        assert!(next >= current + required);
+    }
+
+    #[test]
+    fn growth_always_holds_the_triggering_allocation_with_headroom() {
+        // An allocation larger than the geometric step must still fit twice over
+        for current in [4096u64, 64 * 1024, 1024 * 1024] {
+            let required = current;
+            let next = next_desired_usable_bytes(current, required);
+            assert!(next >= current + 2 * required);
+        }
+    }
+
+    #[test]
+    fn growth_stays_geometric_under_repeated_small_allocations() {
+        let mut size = 64 * 1024u64;
+        let required = 4096u64;
+        let mut grows = 0;
+        while size < 16 * 1024 * 1024 {
+            size = next_desired_usable_bytes(size, required);
+            grows += 1;
+        }
+        // 1.25x reaches 16MiB in 25 grows; the old 2x policy needed 8. The extra
+        // resizes are cheap, while the waste ceiling drops from ~50% to ~20%.
+        assert_eq!(grows, 25);
+    }
 
     // Test that the region tracker expansion code works, by adding more data than fits into the initial max regions
     #[test]
