@@ -608,13 +608,13 @@ impl TableTreeMut {
         &mut self,
         name: &str,
         table_type: TableType,
-    ) -> Result<(Option<BtreeHeader>, u64), TableError> {
-        let table = if let Some(found) = self.get_table::<K, V>(name, table_type)? {
-            found
+    ) -> Result<(Option<BtreeHeader>, u64, bool), TableError> {
+        let (table, created) = if let Some(found) = self.get_table::<K, V>(name, table_type)? {
+            (found, false)
         } else {
             let table = InternalTableDefinition::new::<K, V>(table_type, None, 0);
             self.tree.insert(&name, &table)?;
-            table
+            (table, true)
         };
 
         match table {
@@ -627,7 +627,7 @@ impl TableTreeMut {
                 table_root,
                 table_length,
                 ..
-            } => Ok((table_root, table_length)),
+            } => Ok((table_root, table_length, created)),
         }
     }
 

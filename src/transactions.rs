@@ -562,7 +562,7 @@ impl SystemNamespace {
         &'s mut self,
         definition: SystemTableDefinition<K, V>,
     ) -> Result<SystemTable<'s, K, V>> {
-        let (root, _) = self
+        let (root, _, _) = self
             .table_tree
             .get_or_create_table::<K, V>(definition.name(), TableType::Normal)
             .map_err(|e| {
@@ -662,19 +662,19 @@ impl TableNamespace {
         &mut self,
         name: &str,
         table_type: TableType,
-    ) -> Result<(Option<BtreeHeader>, u64), TableError> {
+    ) -> Result<(Option<BtreeHeader>, u64, bool), TableError> {
         if let Some(location) = self.open_tables.get(name) {
             return Err(TableError::TableAlreadyOpen(name.to_string(), location));
         }
 
-        let root = self
+        let (root, length, created) = self
             .table_tree
             .get_or_create_table::<K, V>(name, table_type)?;
         self.table_tree.clear_pending_table_update(name);
         self.open_tables
             .insert(name.to_string(), panic::Location::caller());
 
-        Ok(root)
+        Ok((root, length, created))
     }
 
     #[track_caller]
@@ -685,7 +685,7 @@ impl TableNamespace {
     ) -> Result<MultimapTable<'txn, K, V>, TableError> {
         #[cfg(feature = "logging")]
         debug!("Opening multimap table: {definition}");
-        let (root, length) = self.inner_open::<K, V>(definition.name(), TableType::Multimap)?;
+        let (root, length, _) = self.inner_open::<K, V>(definition.name(), TableType::Multimap)?;
         self.set_dirty(transaction);
 
         Ok(MultimapTable::new(
@@ -700,6 +700,32 @@ impl TableNamespace {
     }
 
     #[track_caller]
+    pub fn create_multimap_table<'txn, K: Key + 'static, V: Key + 'static>(
+        &mut self,
+        transaction: &'txn WriteTransaction,
+        definition: MultimapTableDefinition<K, V>,
+    ) -> Result<(MultimapTable<'txn, K, V>, bool), TableError> {
+        #[cfg(feature = "logging")]
+        debug!("Creating multimap table: {definition}");
+        let (root, length, created) =
+            self.inner_open::<K, V>(definition.name(), TableType::Multimap)?;
+        self.set_dirty(transaction);
+
+        Ok((
+            MultimapTable::new(
+                definition.name(),
+                root,
+                length,
+                self.freed_pages.clone(),
+                self.allocated_pages.clone(),
+                self.table_tree.page_allocator().clone(),
+                transaction,
+            ),
+            created,
+        ))
+    }
+
+    #[track_caller]
     pub fn open_table<'txn, K: Key + 'static, V: Value + 'static>(
         &mut self,
         transaction: &'txn WriteTransaction,
@@ -707,7 +733,7 @@ impl TableNamespace {
     ) -> Result<Table<'txn, K, V>, TableError> {
         #[cfg(feature = "logging")]
         debug!("Opening table: {definition}");
-        let (root, _) = self.inner_open::<K, V>(definition.name(), TableType::Normal)?;
+        let (root, _, _) = self.inner_open::<K, V>(definition.name(), TableType::Normal)?;
         self.set_dirty(transaction);
 
         Ok(Table::new(
@@ -717,6 +743,30 @@ impl TableNamespace {
             self.allocated_pages.clone(),
             self.table_tree.page_allocator().clone(),
             transaction,
+        ))
+    }
+
+    #[track_caller]
+    pub fn create_table<'txn, K: Key + 'static, V: Value + 'static>(
+        &mut self,
+        transaction: &'txn WriteTransaction,
+        definition: TableDefinition<K, V>,
+    ) -> Result<(Table<'txn, K, V>, bool), TableError> {
+        #[cfg(feature = "logging")]
+        debug!("Creating table: {definition}");
+        let (root, _, created) = self.inner_open::<K, V>(definition.name(), TableType::Normal)?;
+        self.set_dirty(transaction);
+
+        Ok((
+            Table::new(
+                definition.name(),
+                root,
+                self.freed_pages.clone(),
+                self.allocated_pages.clone(),
+                self.table_tree.page_allocator().clone(),
+                transaction,
+            ),
+            created,
         ))
     }
 
@@ -1535,6 +1585,78 @@ impl WriteTransaction {
             .lock()
             .unwrap()
             .open_multimap_table(self, definition)
+    }
+
+    /// Create the given table, or open it if it already exists
+    ///
+    /// Returns the table and whether this call created it. If the table already exists, its
+    /// stored key and value types must match the definition, as with [`Self::open_table`].
+    #[track_caller]
+    pub fn create_table<'txn, K: Key + 'static, V: Value + 'static>(
+        &'txn self,
+        definition: TableDefinition<K, V>,
+    ) -> Result<(Table<'txn, K, V>, bool), TableError> {
+        self.tables.lock().unwrap().create_table(self, definition)
+    }
+
+    /// Create the given multimap table, or open it if it already exists
+    ///
+    /// Returns the table and whether this call created it. If the table already exists, its
+    /// stored key and value types must match the definition, as with
+    /// [`Self::open_multimap_table`].
+    #[track_caller]
+    pub fn create_multimap_table<'txn, K: Key + 'static, V: Key + 'static>(
+        &'txn self,
+        definition: MultimapTableDefinition<K, V>,
+    ) -> Result<(MultimapTable<'txn, K, V>, bool), TableError> {
+        self.tables
+            .lock()
+            .unwrap()
+            .create_multimap_table(self, definition)
+    }
+
+    /// Create the given table, or open it if it already exists
+    ///
+    /// This is an alias for [`Self::create_table`].
+    #[track_caller]
+    pub fn create_table_if_not_exists<'txn, K: Key + 'static, V: Value + 'static>(
+        &'txn self,
+        definition: TableDefinition<K, V>,
+    ) -> Result<(Table<'txn, K, V>, bool), TableError> {
+        self.create_table(definition)
+    }
+
+    /// Create the given multimap table, or open it if it already exists
+    ///
+    /// This is an alias for [`Self::create_multimap_table`].
+    #[track_caller]
+    pub fn create_multimap_table_if_not_exists<'txn, K: Key + 'static, V: Key + 'static>(
+        &'txn self,
+        definition: MultimapTableDefinition<K, V>,
+    ) -> Result<(MultimapTable<'txn, K, V>, bool), TableError> {
+        self.create_multimap_table(definition)
+    }
+
+    /// Create the given table, or open it if it already exists
+    ///
+    /// This is an alias for [`Self::create_table`].
+    #[track_caller]
+    pub fn open_table_if_not_exists<'txn, K: Key + 'static, V: Value + 'static>(
+        &'txn self,
+        definition: TableDefinition<K, V>,
+    ) -> Result<(Table<'txn, K, V>, bool), TableError> {
+        self.create_table(definition)
+    }
+
+    /// Create the given multimap table, or open it if it already exists
+    ///
+    /// This is an alias for [`Self::create_multimap_table`].
+    #[track_caller]
+    pub fn open_multimap_table_if_not_exists<'txn, K: Key + 'static, V: Key + 'static>(
+        &'txn self,
+        definition: MultimapTableDefinition<K, V>,
+    ) -> Result<(MultimapTable<'txn, K, V>, bool), TableError> {
+        self.create_multimap_table(definition)
     }
 
     pub(crate) fn close_table<K: Key + 'static, V: Value + 'static>(

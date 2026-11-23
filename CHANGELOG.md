@@ -1,5 +1,11 @@
 # redb - Changelog
 
+## Unreleased
+
+### Changes
+* Add `WriteTransaction::create_table()` and `create_multimap_table()`, which open an existing
+  table or create it if needed and report whether it was newly created.
+
 ## 5.0.0 - 2026-11-18
 
 ### Breaking changes
